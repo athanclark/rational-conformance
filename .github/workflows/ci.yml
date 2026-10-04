@@ -1,0 +1,156 @@
+name: Rational conformance
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      sqlite_ref:
+        description: 'sqlite-rational branch, tag, or commit (blank = default branch)'
+        type: string
+        required: false
+      map_ref:
+        description: 'rational-map branch, tag, or commit (blank = default branch)'
+        type: string
+        required: false
+      pgmp_ref:
+        description: 'pgmp branch, tag, or commit (default = stable 1.0.6 commit)'
+        type: string
+        default: '1849585416f2bc3d070bf8cef6a659907687ec7f'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.sqlite_ref }}-${{ inputs.map_ref }}-${{ inputs.pgmp_ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  workflow:
+    name: Workflow syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check GitHub Actions workflows
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          printf '%s  %s\n' 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 \
+            "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/*.yml
+
+  conformance:
+    name: Upstream SQLite / RationalMap / pgmp
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PG_CONFIG: /usr/lib/postgresql/16/bin/pg_config
+      PGUSER: rational_test
+      PGDATABASE: rational_conformance
+      PGPORT: '5432'
+    steps:
+      - name: Set disposable PostgreSQL paths
+        run: |
+          printf 'PGDATA=%s/rational-pg-data\nPGHOST=%s/rational-pg-socket\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Check out the independent conformance suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out upstream sqlite-rational
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: athanclark/sqlite-rational
+          ref: ${{ inputs.sqlite_ref }}
+          path: upstream/sqlite-rational
+          persist-credentials: false
+      - name: Check out upstream rational-map
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: athanclark/rational-map
+          ref: ${{ inputs.map_ref }}
+          path: upstream/rational-map
+          persist-credentials: false
+      - name: Check out stable pgmp (or the requested ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dvarrazzo/pgmp
+          ref: ${{ inputs.pgmp_ref || '1849585416f2bc3d070bf8cef6a659907687ec7f' }}
+          path: upstream/pgmp
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: upstream/rational-map/package-lock.json
+      - name: Install native and PostgreSQL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgmp-dev libsqlite3-dev pkg-config \
+            postgresql-16 postgresql-server-dev-16 python3
+          "$PG_CONFIG" --bindir >> "$GITHUB_PATH"
+      - name: Check the harness and its failure reporting
+        run: python3 -m unittest discover -s test -v
+      - name: Record the exact upstream revisions and tool versions
+        run: |
+          mkdir -p artifacts
+          python3 scripts/versions.py --output artifacts/versions.json
+          cat artifacts/versions.json
+      - name: Build and test upstream sqlite-rational
+        run: |
+          cmake -S upstream/sqlite-rational -B upstream/sqlite-rational/build \
+            -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build upstream/sqlite-rational/build --parallel 2
+          ctest --test-dir upstream/sqlite-rational/build --output-on-failure --no-tests=error
+      - name: Build and test upstream rational-map
+        working-directory: upstream/rational-map
+        run: |
+          npm ci --ignore-scripts
+          npm test
+      - name: Build and install real pgmp
+        working-directory: upstream/pgmp
+        run: |
+          python3 tools/unmix.py < sql/pgmp.pysql > sql/pgmp--1.1.sql
+          python3 tools/sql2extension.py --extname pgmp sql/pgmp--1.1.sql > sql/pgmp--unpackaged--1.1.sql
+          make PG_CONFIG="$PG_CONFIG" -j2
+          sudo make PG_CONFIG="$PG_CONFIG" install
+      - name: Start an isolated PostgreSQL database with pgmp
+        run: |
+          mkdir -p "$PGHOST"
+          initdb -D "$PGDATA" --username="$PGUSER" --auth-local=trust --auth-host=reject
+          pg_ctl -D "$PGDATA" -l "$GITHUB_WORKSPACE/artifacts/postgres.log" \
+            -o "-F -k \"$PGHOST\" -c listen_addresses=''" -w start
+          createdb --maintenance-db=postgres "$PGDATABASE"
+          psql -X -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION pgmp;'
+          psql -X -v ON_ERROR_STOP=1 -c "SELECT version(), extversion FROM pg_extension WHERE extname = 'pgmp';"
+      - name: Require agreement with the exact oracle in every backend
+        run: |
+          python3 run.py --require-pgmp --pg-dsn "dbname=$PGDATABASE" \
+            --sqlite-extension upstream/sqlite-rational/build/sqlite_rational.so \
+            --rational-map upstream/rational-map/dist/index.js \
+            --rational-map upstream/rational-map/dist/browser.js \
+            --report artifacts/conformance.json
+      - name: Add versions and results to the run summary
+        if: always()
+        run: python3 scripts/summary.py >> "$GITHUB_STEP_SUMMARY"
+      - name: Stop the disposable PostgreSQL server
+        if: always()
+        run: |
+          if test -f "$PGDATA/postmaster.pid"; then
+            pg_ctl -D "$PGDATA" -m immediate -w stop
+          fi
+      - name: Upload conformance results and reproduction details
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rational-conformance-results
+          path: artifacts/
+          if-no-files-found: warn
