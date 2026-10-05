@@ -25,6 +25,9 @@ The Ubuntu 24.04 job uses Node 24 and PostgreSQL 16. It:
 - Installs rational-map's locked dependencies and runs its build/unit tests.
 - Compiles upstream pgmp against the installed PostgreSQL headers and installs
   the extension. Its SQL scripts are generated explicitly with Python 3.
+  Both build and install use `with_llvm=no`, producing the native extension
+  without optional LLVM bitcode. This avoids depending on the specific Clang
+  and llvm-lto versions recorded in the runner's PostgreSQL build configuration.
 - Initializes a disposable PostgreSQL cluster with its own Unix socket directory,
   disables TCP listening, and creates a test database with `CREATE EXTENSION pgmp`.
 - Runs all 160 bounded range/overview and 42 arithmetic cases against SQLite,
@@ -57,5 +60,14 @@ The conformance suite passed from an isolated directory using the libraries'
 published commits (`7239057` for SQLite and `16b87f0` for RationalMap), Node 24,
 and actual pgmp 1.0.6 installed through `CREATE EXTENSION` on PostgreSQL 18.6.
 Local socket restrictions required PostgreSQL's single-user backend and local
-extension load paths. The new hosted PostgreSQL 16 job still needs its first
-conformance-repository push; the two libraries' hosted workflows already passed.
+extension load paths. The first hosted conformance run failed because PostgreSQL's
+PGXS configuration requested a missing `clang-19` executable. The workflow now
+disables optional LLVM bitcode for both build and install. Hosted PostgreSQL 16
+validation of this fix awaits the next push; the two libraries' hosted workflows
+already passed.
+
+The missing-Clang failure was reproduced locally. A clean pgmp build and staged
+installation then succeeded with `with_llvm=no` and both Clang and LLVM tools
+deliberately unavailable. The resulting native extension loaded via
+`CREATE EXTENSION` and passed all 160 range/overview and 42 arithmetic cases on
+PostgreSQL 18.6, alongside SQLite and both RationalMap exports.

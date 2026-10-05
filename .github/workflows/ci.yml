@@ -120,8 +120,10 @@ jobs:
         run: |
           python3 tools/unmix.py < sql/pgmp.pysql > sql/pgmp--1.1.sql
           python3 tools/sql2extension.py --extname pgmp sql/pgmp--1.1.sql > sql/pgmp--unpackaged--1.1.sql
-          make PG_CONFIG="$PG_CONFIG" -j2
-          sudo make PG_CONFIG="$PG_CONFIG" install
+          # Conformance exercises the native extension; LLVM bitcode is optional.
+          # Apply the same setting during installation to skip llvm-lto as well.
+          make PG_CONFIG="$PG_CONFIG" with_llvm=no -j2
+          sudo make PG_CONFIG="$PG_CONFIG" with_llvm=no install
       - name: Start an isolated PostgreSQL database with pgmp
         run: |
           mkdir -p "$PGHOST"
